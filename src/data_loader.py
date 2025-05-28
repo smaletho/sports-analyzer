@@ -14,13 +14,51 @@ from pybaseball import (
     batting_stats_range,
     pitching_stats_range
 )
+import os
+import json
+
 
 import warnings
+
 warnings.filterwarnings("ignore", category=FutureWarning, module="pybaseball")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Mapping from MLB API team names to pybaseball team abbreviations
+MLB_TEAM_MAPPING = {
+    "Arizona Diamondbacks": "ARI",
+    "Atlanta Braves": "ATL",
+    "Baltimore Orioles": "BAL",
+    "Boston Red Sox": "BOS",
+    "Chicago Cubs": "CHC",
+    "Chicago White Sox": "CWS",
+    "Cincinnati Reds": "CIN",
+    "Cleveland Guardians": "CLE",
+    "Colorado Rockies": "COL",
+    "Detroit Tigers": "DET",
+    "Houston Astros": "HOU",
+    "Kansas City Royals": "KC",
+    "Los Angeles Angels": "LAA",
+    "Los Angeles Dodgers": "LAD",
+    "Miami Marlins": "MIA",
+    "Milwaukee Brewers": "MIL",
+    "Minnesota Twins": "MIN",
+    "New York Mets": "NYM",
+    "New York Yankees": "NYY",
+    "Oakland Athletics": "OAK",
+    "Philadelphia Phillies": "PHI",
+    "Pittsburgh Pirates": "PIT",
+    "San Diego Padres": "SD",
+    "San Francisco Giants": "SF",
+    "Seattle Mariners": "SEA",
+    "St. Louis Cardinals": "STL",
+    "Tampa Bay Rays": "TB",
+    "Texas Rangers": "TEX",
+    "Toronto Blue Jays": "TOR",
+    "Washington Nationals": "WSN"
+}
 
 # Approximate home run factor by ballpark (100 = neutral)
 BALLPARK_HR_FACTORS = {
@@ -84,6 +122,11 @@ class OptimizedDataLoader:
         Returns:
             Dictionary mapping team names to their statistics
         """
+        cached = load_team_stats_from_cache(end_date)
+        if cached:
+            logger.info(f"Loaded team stats from cache for {end_date}")
+            return cached
+
         # Create tasks for all teams
         tasks = [
             self._get_team_stats_optimized_async(team, end_date, days)
@@ -106,6 +149,8 @@ class OptimizedDataLoader:
             else:
                 team_stats[team] = result
 
+        # Save to disk for reuse
+        save_team_stats_to_cache(team_stats, end_date)
         return team_stats
 
     async def _get_team_stats_optimized_async(self, team: str, end_date: str, days: int = 14) -> Dict[str, Any]:
@@ -135,26 +180,43 @@ class OptimizedDataLoader:
         Synchronous team stats calculation optimized for parallel execution.
         """
         try:
-            end_date_obj = datetime.strptime(end_date, '%Y-%m-%d')
-            start_date = (end_date_obj - timedelta(days=days)).strftime('%Y-%m-%d')
-        except ValueError:
-            end_date_obj = datetime.now()
-            start_date = (end_date_obj - timedelta(days=days)).strftime('%Y-%m-%d')
-            end_date = end_date_obj.strftime('%Y-%m-%d')
+            # Convert team name to abbreviation
+            team_abbrev = MLB_TEAM_MAPPING.get(team, team)
 
-        try:
+            # Parse end date
+            try:
+                end_date_obj = datetime.strptime(end_date, '%Y-%m-%d')
+            except ValueError:
+                end_date_obj = datetime.now()
+                end_date = end_date_obj.strftime('%Y-%m-%d')
+
+            start_date = (end_date_obj - timedelta(days=days)).strftime('%Y-%m-%d')
+
             # Check cache for statcast data
             cache_key = f"statcast_{start_date}_{end_date}"
             if cache_key in _statcast_cache:
                 df = _statcast_cache[cache_key]
             else:
+                logger.info(f"Fetching Statcast data from {start_date} to {end_date}")
                 df = statcast(start_date, end_date)
                 _statcast_cache[cache_key] = df
 
-            # Filter for the specific team
-            df_team = df[(df['home_team'] == team) | (df['away_team'] == team)]
+            if df.empty:
+                logger.warning(f"No Statcast data available for date range {start_date} to {end_date}")
+                return {
+                    "team": team,
+                    "total_hr": 0,
+                    "total_hits": 0,
+                    "avg_ev": 0,
+                    "days": days,
+                    "summary": f"No recent data for team {team}."
+                }
+
+            # Filter for the specific team using abbreviation
+            df_team = df[(df['home_team'] == team_abbrev) | (df['away_team'] == team_abbrev)]
 
             if df_team.empty:
+                logger.warning(f"No data found for team {team} (abbrev: {team_abbrev})")
                 return {
                     "team": team,
                     "total_hr": 0,
@@ -171,6 +233,8 @@ class OptimizedDataLoader:
             total_hr = hr_mask.sum()
             total_hits = hits_mask.sum()
             avg_ev = df_team['launch_speed'].mean()
+
+            logger.info(f"Team stats for {team}: {total_hr} HRs, {total_hits} hits")
 
             return {
                 "team": team,
@@ -252,7 +316,14 @@ _data_loader = OptimizedDataLoader()
 @lru_cache(maxsize=1000)
 def get_cached_player_lookup(first_name: str, last_name: str) -> pd.DataFrame:
     """Cached player lookup to avoid repeated API calls."""
-    return playerid_lookup(first_name, last_name)
+    try:
+        logger.info(f"Looking up player: {first_name} {last_name}")
+        result = playerid_lookup(first_name, last_name)
+        logger.info(f"Player lookup result shape: {result.shape if not result.empty else 'empty'}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in player lookup for {first_name} {last_name}: {e}")
+        return pd.DataFrame()
 
 
 def get_recent_batter_stats_optimized(batter_id: int, end_date: datetime, days: int = 14) -> Dict[str, Any]:
@@ -269,10 +340,12 @@ def get_recent_batter_stats_optimized(batter_id: int, end_date: datetime, days: 
         if cache_key in _statcast_cache:
             df = _statcast_cache[cache_key]
         else:
+            logger.info(f"Fetching batter stats for ID {batter_id} from {start_date} to {end_date_str}")
             df = statcast_batter(start_date, end_date_str, batter_id)
             _statcast_cache[cache_key] = df
 
         if df.empty:
+            logger.warning(f"No batter data for ID {batter_id}")
             return {
                 "summary": "No recent batter data available.",
                 "hr": 0,
@@ -284,6 +357,8 @@ def get_recent_batter_stats_optimized(batter_id: int, end_date: datetime, days: 
         hr = (df['events'].fillna('') == 'home_run').sum()
         ab = len(df)
         avg_ev = df['launch_speed'].mean()
+
+        logger.info(f"Batter {batter_id} stats: {hr} HRs in {ab} ABs")
 
         return {
             "summary": f"Recent: {hr} HRs in {ab} ABs. Avg EV: {avg_ev:.1f} mph.",
@@ -312,10 +387,12 @@ def get_pitcher_stats_optimized(pitcher_id: int, end_date: datetime, days: int =
         if cache_key in _statcast_cache:
             df = _statcast_cache[cache_key]
         else:
+            logger.info(f"Fetching pitcher stats for ID {pitcher_id} from {start_date} to {end_date_str}")
             df = statcast_pitcher(start_date, end_date_str, pitcher_id)
             _statcast_cache[cache_key] = df
 
         if df.empty:
+            logger.warning(f"No pitcher data for ID {pitcher_id}")
             return {
                 "summary": "No recent pitcher data available.",
                 "hr_allowed": 0,
@@ -326,6 +403,8 @@ def get_pitcher_stats_optimized(pitcher_id: int, end_date: datetime, days: int =
         hr_allowed = (df['events'].fillna('') == 'home_run').sum()
         total_batters = len(df)
         avg_ev = df['launch_speed'].mean()
+
+        logger.info(f"Pitcher {pitcher_id} stats: {hr_allowed} HRs allowed in {total_batters} batters")
 
         return {
             "summary": f"Pitcher allowed {hr_allowed} HRs in {total_batters} batters. Avg EV allowed: {avg_ev:.1f} mph.",
@@ -349,30 +428,34 @@ def get_matchup_stats_optimized(batter_id: int, pitcher_id: int, opponent_team: 
     start_date = "2018-01-01"
     end_date = game_date.strftime('%Y-%m-%d')
 
+    # Convert opponent team to abbreviation
+    opponent_abbrev = MLB_TEAM_MAPPING.get(opponent_team, opponent_team)
+
     cache_key = f"batter_full_{batter_id}_{start_date}_{end_date}"
 
     try:
         if cache_key in _statcast_cache:
             full_df = _statcast_cache[cache_key]
         else:
+            logger.info(f"Fetching full batter history for ID {batter_id}")
             full_df = statcast_batter(start_date, end_date, batter_id)
             _statcast_cache[cache_key] = full_df
 
         if full_df.empty:
+            logger.warning(f"No historical batter data for ID {batter_id}")
             return "No historical batter data available.", "No historical team data available."
 
-        # Vectorized team assignment
-        full_df['batter_team'] = full_df.apply(
-            lambda row: row['away_team'] if row['inning_topbot'] == 'Top' else row['home_team'],
-            axis=1
-        )
-        full_df['opponent_team'] = full_df.apply(
+        # Filter matchups
+        vs_pitcher = full_df[full_df['pitcher'] == pitcher_id]
+
+        # For team matchups, we need to determine which team the batter was facing
+        # If batter's team was away (top inning), they faced the home team
+        # If batter's team was home (bottom inning), they faced the away team
+        full_df['opponent'] = full_df.apply(
             lambda row: row['home_team'] if row['inning_topbot'] == 'Top' else row['away_team'],
             axis=1
         )
-
-        vs_pitcher = full_df[full_df['pitcher'] == pitcher_id]
-        vs_team = full_df[full_df['opponent_team'] == opponent_team]
+        vs_team = full_df[full_df['opponent'] == opponent_abbrev]
 
         def summarize_optimized(df: pd.DataFrame, label: str) -> str:
             if df.empty:
@@ -384,7 +467,12 @@ def get_matchup_stats_optimized(batter_id: int, pitcher_id: int, opponent_team: 
 
             return f"{label}: {hr} HRs in {ab} ABs. Avg EV: {avg_ev:.1f} mph."
 
-        return summarize_optimized(vs_pitcher, "Vs Pitcher"), summarize_optimized(vs_team, "Vs Team")
+        vs_pitcher_summary = summarize_optimized(vs_pitcher, "Vs Pitcher")
+        vs_team_summary = summarize_optimized(vs_team, "Vs Team")
+
+        logger.info(f"Matchup stats - vs pitcher: {len(vs_pitcher)} ABs, vs team: {len(vs_team)} ABs")
+
+        return vs_pitcher_summary, vs_team_summary
 
     except Exception as e:
         logger.error(f"Error in matchup stats: {e}")
@@ -394,27 +482,55 @@ def get_matchup_stats_optimized(batter_id: int, pitcher_id: int, opponent_team: 
 @lru_cache(maxsize=500)
 def get_hand_splits_cached(batter_name: str, pitcher_name: str) -> str:
     """
-    Cached version of handedness lookup.
+    Cached version of handedness lookup with improved name parsing.
     """
     try:
-        batter_parts = batter_name.split()
-        pitcher_parts = pitcher_name.split()
+        # Clean and parse names
+        batter_name = batter_name.strip()
+        pitcher_name = pitcher_name.strip()
 
-        if len(batter_parts) < 2 or len(pitcher_parts) < 2:
+        # Handle names with suffixes (Jr., Sr., III, etc.)
+        def parse_name(full_name):
+            parts = full_name.split()
+            if len(parts) < 2:
+                return None, None
+
+            # Remove common suffixes
+            suffixes = ['Jr.', 'Sr.', 'II', 'III', 'IV', 'V']
+            while parts and parts[-1] in suffixes:
+                parts.pop()
+
+            if len(parts) < 2:
+                return None, None
+
+            first_name = parts[0]
+            last_name = ' '.join(parts[1:])  # Handle multi-part last names
+            return first_name, last_name
+
+        batter_first, batter_last = parse_name(batter_name)
+        pitcher_first, pitcher_last = parse_name(pitcher_name)
+
+        if not all([batter_first, batter_last, pitcher_first, pitcher_last]):
+            logger.warning(f"Could not parse names: '{batter_name}', '{pitcher_name}'")
             return "Handedness info not available - invalid names."
 
-        batter = get_cached_player_lookup(batter_parts[0], batter_parts[1])
-        pitcher = get_cached_player_lookup(pitcher_parts[0], pitcher_parts[1])
+        logger.info(f"Looking up handedness: {batter_first} {batter_last} vs {pitcher_first} {pitcher_last}")
+
+        batter = get_cached_player_lookup(batter_first, batter_last)
+        pitcher = get_cached_player_lookup(pitcher_first, pitcher_last)
 
         if batter.empty or pitcher.empty:
+            logger.warning(f"Player lookup failed - batter empty: {batter.empty}, pitcher empty: {pitcher.empty}")
             return "Handedness info not available."
 
         batter_hand = batter.iloc[0]['bats']
         pitcher_hand = pitcher.iloc[0]['throws']
 
         if pd.isna(batter_hand) or pd.isna(pitcher_hand):
+            logger.warning(f"Handedness data missing - batter: {batter_hand}, pitcher: {pitcher_hand}")
             return "Handedness data missing."
 
+        logger.info(f"Handedness found - batter bats: {batter_hand}, pitcher throws: {pitcher_hand}")
         return f"Batter bats {batter_hand}, Pitcher throws {pitcher_hand}. Matchup: {batter_hand} vs {pitcher_hand}"
 
     except Exception as e:
@@ -443,12 +559,20 @@ def get_team_stats(team: str, end_date: str, days: int = 14) -> Dict[str, Any]:
     return asyncio.run(get_team_stats_async(team, end_date, days))
 
 
-async def generate_context_summary_async(batter_id: int, pitcher_id: int, batter_team: str,
-                                         pitcher_team: str, game_date: datetime,
-                                         batter_name: str, pitcher_name: str,
-                                         ballpark_name: str, team_stats: dict = None) -> str:
+async def generate_context_summary_async(
+    batter_id: int,
+    pitcher_id: int,
+    batter_team: str,
+    pitcher_team: str,
+    game_date: datetime,
+    batter_name: str,
+    pitcher_name: str,
+    ballpark_name: str,
+    team_stats: dict = None,
+    source: str = "previous_game"
+) -> dict:
     """
-    Async version of generate_context_summary with parallel data fetching.
+    Async version of generate_context_summary that returns structured JSON data.
     """
     # Create tasks for parallel execution
     tasks = [
@@ -459,60 +583,56 @@ async def generate_context_summary_async(batter_id: int, pitcher_id: int, batter
     # Execute batter and pitcher stats in parallel
     batter_result, pitcher_result = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Handle results
-    recent_batter = batter_result.get("summary", "Error") if not isinstance(batter_result,
-                                                                            Exception) else "Error retrieving batter stats"
-    pitcher_stats = pitcher_result.get("summary", "Error") if not isinstance(pitcher_result,
-                                                                             Exception) else "Error retrieving pitcher stats"
+    # Parse results
+    batter_stats = batter_result if not isinstance(batter_result, Exception) else {}
+    pitcher_stats_data = pitcher_result if not isinstance(pitcher_result, Exception) else {}
 
-    # Get matchup stats (run in thread pool since it's CPU intensive)
+    recent_batter = batter_stats.get("parsed", {})  # Use parsed version instead of text summary
+    recent_pitcher = pitcher_stats_data.get("parsed", {})
+
+    # Get matchup stats (CPU intensive)
     loop = asyncio.get_event_loop()
-    vs_pitcher, vs_team = await loop.run_in_executor(
+    vs_pitcher_stats, vs_team_stats = await loop.run_in_executor(
         _data_loader.thread_executor,
         get_matchup_stats_optimized,
         batter_id, pitcher_id, pitcher_team, game_date
     )
 
-    # Use pre-computed team stats if available
+    # Get team stats (batting and pitching)
     if team_stats and batter_team in team_stats:
-        batter_team_form = team_stats[batter_team]["summary"]
+        batter_team_form = team_stats[batter_team].get("parsed", {})
     else:
         batter_team_stats = await get_team_stats_async(batter_team, game_date.strftime('%Y-%m-%d'))
-        batter_team_form = batter_team_stats["summary"]
+        batter_team_form = batter_team_stats.get("parsed", {})
 
     if team_stats and pitcher_team in team_stats:
-        pitcher_team_form = team_stats[pitcher_team]["summary"]
+        pitcher_team_form = team_stats[pitcher_team].get("parsed", {})
     else:
         pitcher_team_stats = await get_team_stats_async(pitcher_team, game_date.strftime('%Y-%m-%d'))
-        pitcher_team_form = pitcher_team_stats["summary"]
+        pitcher_team_form = pitcher_team_stats.get("parsed", {})
 
-    # Get cached handedness and ballpark info
-    handedness = get_hand_splits_cached(batter_name, pitcher_name)
-    ballpark_factor = get_ballpark_factor_cached(ballpark_name)
+    # Get handedness and ballpark factor
+    handedness_info = get_hand_splits_cached(batter_name, pitcher_name)
+    park_factor = get_ballpark_factor_cached(ballpark_name)
 
-    return "\n".join([
-        f"=== {batter_name} vs {pitcher_name} on {game_date.strftime('%Y-%m-%d')} ===",
-        "",
-        "=== Batter Recent Performance ===",
-        recent_batter,
-        "",
-        "=== Matchup History ===",
-        vs_pitcher,
-        vs_team,
-        "",
-        "=== Team Trends ===",
-        batter_team_form,
-        pitcher_team_form,
-        "",
-        "=== Pitcher Recent Performance ===",
-        pitcher_stats,
-        "",
-        "=== Handedness Matchup ===",
-        handedness,
-        "",
-        "=== Park Factors ===",
-        ballpark_factor
-    ])
+    # Final JSON object
+    return {
+        "player_name": batter_name,
+        "game_date": game_date.strftime('%Y-%m-%d'),
+        "game": f"{batter_team} vs {pitcher_team}",
+        "opposing_pitcher": pitcher_name,
+        "ballpark": ballpark_name,
+        "ballpark_factor": park_factor,
+        "handedness_matchup": handedness_info,
+        "batter_recent_performance": recent_batter,
+        "matchup_history_vs_pitcher": vs_pitcher_stats,
+        "matchup_history_vs_team": vs_team_stats,
+        "batter_team_trend": batter_team_form,
+        "pitcher_team_trend": pitcher_team_form,
+        "pitcher_recent_performance": recent_pitcher,
+        "source": source
+    }
+
 
 
 def generate_context_summary(batter_id: int, pitcher_id: int, batter_team: str,
@@ -608,3 +728,16 @@ def get_cache_info() -> Dict[str, Any]:
         "statcast_cache_size": len(_statcast_cache),
         "team_stats_cache_size": len(_team_stats_cache)
     }
+
+def save_team_stats_to_cache(stats: Dict[str, Any], date_str: str) -> None:
+    os.makedirs("cache", exist_ok=True)
+    with open(f"cache/team_stats_{date_str}.json", "w") as f:
+        json.dump(stats, f)
+
+
+def load_team_stats_from_cache(date_str: str) -> Optional[Dict[str, Any]]:
+    path = f"cache/team_stats_{date_str}.json"
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return None

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import json
 
-from src.data_loader import generate_context_summary, get_team_stats, _data_loader
+from src.data_loader import generate_context_summary, get_team_stats_async, _data_loader
 
 
 class MLBSchedule:
@@ -22,7 +22,7 @@ class MLBSchedule:
     BASE_URL = "https://statsapi.mlb.com/api/v1"
 
     def __init__(self):
-        self.timeout = aiohttp.ClientTimeout(total=10)
+        self.timeout = aiohttp.ClientTimeout(total=30)  # Increased timeout for stability
 
     async def get_games_for_date(self, date: str) -> Dict[str, Any]:
         """
@@ -61,22 +61,33 @@ class MLBSchedule:
                     if home:
                         team_names.add(home)
 
+            print(f"Found {len(games_raw)} games with teams: {list(team_names)}")
+
             # Fetch team stats using the OptimizedDataLoader
-            team_stats = await _data_loader.get_multiple_team_stats_async(list(team_names), date)
+            print("Fetching team statistics in parallel...")
+            #team_stats = await _data_loader.get_multiple_team_stats_async(list(team_names), date)
+            team_stats = {}
+            for team in team_names:
+                print(f"Fetching stats for team: {team}")
+                team_stats[team] = await get_team_stats_async(team, date)
+                print(f"Retrieved stats for team: {team}")
+            print(f"Retrieved stats for {len(team_stats)} teams")
 
             # Process games in parallel
+            print("Processing game details...")
             game_tasks = [self._process_game_async(session, g) for g in games_raw]
             game_results = await asyncio.gather(*game_tasks, return_exceptions=True)
 
             games_data = []
-            for game_result in game_results:
+            for i, game_result in enumerate(game_results):
                 if isinstance(game_result, Exception):
-                    print(f"Error processing game: {game_result}")
+                    print(f"Error processing game {i+1}: {game_result}")
                     continue
                 if game_result:
                     away = game_result.get('away_team', {}).get('name')
                     home = game_result.get('home_team', {}).get('name')
 
+                    # Attach team stats to game data
                     game_result['team_stats'] = {}
                     if away and away in team_stats:
                         game_result['team_stats'][away] = team_stats[away]
@@ -85,24 +96,12 @@ class MLBSchedule:
 
                     games_data.append(game_result)
 
+            print(f"Successfully processed {len(games_data)} games")
             return {
                 'date': date,
                 'games': games_data,
                 'team_stats': team_stats
             }
-
-    async def _get_team_stats_async(self, team_name: str, date: str) -> Any:
-        """
-        Asynchronously get team stats using the optimized data loader.
-
-        Args:
-            team_name: Name of the team
-            date: Date string
-
-        Returns:
-            Team statistics
-        """
-        return await _data_loader._get_team_stats_optimized_async(team_name, date).run_in_executor(None, get_team_stats, team_name, date)
 
     async def _process_game_async(self, session: aiohttp.ClientSession, game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -117,6 +116,7 @@ class MLBSchedule:
         """
         try:
             game_pk = game.get('gamePk')
+            print(f"Processing game {game_pk}")
 
             # Basic game info
             game_info = {
@@ -152,6 +152,7 @@ class MLBSchedule:
 
             # Get lineups if available
             if game_pk:
+                print(f"Fetching lineups for game {game_pk}")
                 lineups_data = await self._get_lineups_async(session, game_pk)
                 game_info['lineups'] = {
                     'away': {
@@ -163,11 +164,13 @@ class MLBSchedule:
                         'source': lineups_data['home']['source']
                     }
                 }
+                print(f"Found lineups - Away: {len(lineups_data['away']['players'])} players ({lineups_data['away']['source']}), "
+                      f"Home: {len(lineups_data['home']['players'])} players ({lineups_data['home']['source']})")
 
             return game_info
 
         except Exception as e:
-            print(f"Error processing game: {e}")
+            print(f"Error processing game {game.get('gamePk', 'unknown')}: {e}")
             return None
 
     def _extract_pitcher_info(self, pitcher_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -205,9 +208,11 @@ class MLBSchedule:
                 lineups['home']['players'] = extracted_lineups['home']
                 lineups['away']['source'] = 'official' if extracted_lineups['away'] else 'none'
                 lineups['home']['source'] = 'official' if extracted_lineups['home'] else 'none'
+                print(f"Found official lineups for game {game_pk}")
 
         # If no lineups found, get team info and try previous game lineups
         if not lineups['away']['players'] and not lineups['home']['players']:
+            print(f"No official lineups found for game {game_pk}, trying previous game lineups")
             # Get game info to determine teams
             schedule_url = f"{self.BASE_URL}/schedule"
             schedule_params = {
@@ -239,16 +244,18 @@ class MLBSchedule:
                         result_idx = 0
                         if away_team_id:
                             away_result = results[result_idx]
-                            if not isinstance(away_result, Exception):
+                            if not isinstance(away_result, Exception) and away_result:
                                 lineups['away']['players'] = away_result
-                                lineups['away']['source'] = 'previous_game' if away_result else 'none'
+                                lineups['away']['source'] = 'previous_game'
+                                print(f"Found previous game lineup for away team: {len(away_result)} players")
                             result_idx += 1
 
-                        if home_team_id:
+                        if home_team_id and result_idx < len(results):
                             home_result = results[result_idx]
-                            if not isinstance(home_result, Exception):
+                            if not isinstance(home_result, Exception) and home_result:
                                 lineups['home']['players'] = home_result
-                                lineups['home']['source'] = 'previous_game' if home_result else 'none'
+                                lineups['home']['source'] = 'previous_game'
+                                print(f"Found previous game lineup for home team: {len(home_result)} players")
 
         return lineups
 
@@ -295,13 +302,13 @@ class MLBSchedule:
         """
         current_date = datetime.now()
 
-        # Create tasks for checking multiple dates in parallel
+        # Create tasks for checking multiple dates in parallel (limit to 5 for efficiency)
         date_tasks = []
-        for days_back in range(1, 11):
+        for days_back in range(1, 6):
             check_date = (current_date - timedelta(days=days_back)).strftime('%Y-%m-%d')
             date_tasks.append(self._check_date_for_team_game(session, team_id, check_date))
 
-        # Execute all date checks in parallel
+        # Execute date checks in parallel
         results = await asyncio.gather(*date_tasks, return_exceptions=True)
 
         # Return the first successful lineup found
@@ -409,7 +416,7 @@ class MLBSchedule:
 
     async def _make_request(self, session: aiohttp.ClientSession, url: str, params: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
         """
-        Make HTTP request to MLB API asynchronously.
+        Make HTTP request to MLB API asynchronously with retry logic.
 
         Args:
             session: aiohttp session
@@ -419,13 +426,32 @@ class MLBSchedule:
         Returns:
             JSON response data or None if request fails
         """
-        try:
-            async with session.get(url, params=params) as response:
-                response.raise_for_status()
-                return await response.json()
-        except Exception as e:
-            print(f"Request failed: {e}")
-            return None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 429:  # Rate limited
+                        wait_time = 2 ** attempt
+                        print(f"Rate limited, waiting {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        response.raise_for_status()
+            except asyncio.TimeoutError:
+                print(f"Request timeout (attempt {attempt + 1}/{max_retries}): {url}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+            except Exception as e:
+                print(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+
+        print(f"All retry attempts failed for: {url}")
+        return None
 
 
 def get_mlb_schedule(date: str) -> Dict[str, Any]:

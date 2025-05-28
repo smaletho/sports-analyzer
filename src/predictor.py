@@ -2,26 +2,39 @@
 
 import ollama
 import re
-from typing import Dict, Any
+import json
+from typing import Dict, Any, List
 
-def predict_home_run_probability(context: str, model: str = "llama3") -> Dict[str, Any]:
+
+def predict_home_run_probabilities(context: List[Dict[str, Any]], model: str = "llama3") -> Dict[str, Any]:
     """
-    Sends a prompt to the Ollama LLM asking for a probability that the batter will hit a home run.
+    Sends a prompt to the Ollama LLM asking for probabilities that batters will hit home runs.
 
     Parameters:
-        context (str): A natural-language summary of the player, pitcher, and game conditions.
+        context (List[Dict[str, Any]]): Array of JSON objects containing player, pitcher, and game data.
         model (str): Name of the locally installed Ollama model to use (e.g., 'llama3').
 
     Returns:
-        Dict with structured prediction data.
+        Dict with structured prediction data for all players.
     """
+    # Convert JSON array to formatted string
+    context_str = json.dumps(context, indent=2)
+
     prompt = (
-        f"{context}\n\n"
-        "Based on the data above, what is the likelihood (as a percentage between 0 and 100) that this player will "
-        "hit a home run in this game? Provide only a number followed by a brief reason."
+        f"{context_str}\n\n"
+        "You are an expert baseball statistician. "
+        "The JSON data above contains information about baseball players scheduled to play today, "
+        "including batting stats, pitcher matchups, recent trends, and ballpark factors. "
+        "Ballpark factors above 100 favor home runs; below 100 suppress them. "
+        "For each player, calculate the probability (0-100%) that they will hit a home run and prepare a brief "
+        "reasoning."
+        "Format your response as:\n"
+        "Player Name: X% - reason\n"
+        "Order by highest to lowest probability."
     )
 
     try:
+        print("Asking Ollama...")
         response = ollama.chat(
             model=model,
             messages=[
@@ -30,18 +43,32 @@ def predict_home_run_probability(context: str, model: str = "llama3") -> Dict[st
         )
         content = response['message']['content'].strip()
 
-        # Extract probability from response
-        match = re.search(r'(\d+(?:\.\d+)?)\s*%', content)
-        probability = float(match.group(1)) if match else None
+        # Extract all player predictions from response
+        predictions = []
+        lines = content.split('\n')
+
+        for line in lines:
+            # Match patterns like "Player Name: 75% - reasoning"
+            match = re.search(r'([^:]+):\s*(\d+(?:\.\d+)?)\s*%\s*-\s*(.+)', line.strip())
+            if match:
+                predictions.append({
+                    "player": match.group(1).strip(),
+                    "probability": float(match.group(2)),
+                    "reasoning": match.group(3).strip()
+                })
 
         return {
-            "probability": probability,
-            "raw_response": content
+            "predictions": predictions,
+            "raw_response": content,
+            "total_players": len(context),
+            "parsed_players": len(predictions)
         }
 
     except Exception as e:
         return {
-            "probability": None,
+            "predictions": [],
             "error": str(e),
-            "raw_response": None
+            "raw_response": None,
+            "total_players": len(context) if context else 0,
+            "parsed_players": 0
         }
