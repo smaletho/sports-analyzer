@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import json
 
-from src.data_loader import generate_context_summary, get_team_stats_async, _data_loader
+from homeruns.data_loader import generate_context_summary, get_team_stats_async, _data_loader
 
 
 class MLBSchedule:

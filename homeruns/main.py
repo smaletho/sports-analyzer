@@ -1,9 +1,10 @@
 import asyncio
 from datetime import date, datetime, timezone
-from src.mlb_schedule import get_mlb_schedule_async
-from src.data_loader import generate_context_summary_async
-from src.predictor import predict_home_run_probabilities
-
+from homeruns.mlb_schedule import get_mlb_schedule_async
+from homeruns.data_loader import generate_context_summary_async
+from homeruns.predictor import predict_single_player_home_run, analyze_top_home_run_candidates
+from collections import defaultdict
+from operator import itemgetter
 
 async def generate_all_batter_summaries(query_date: str = None) -> list:
     """
@@ -90,6 +91,8 @@ async def generate_all_batter_summaries(query_date: str = None) -> list:
                         team_stats=team_stats,
                         source=source
                     )
+                    # Add batter_team field to help with team grouping later
+                    summary["batter_team"] = team_name
                     summaries.append(summary)
 
                 except Exception as e:
@@ -98,6 +101,57 @@ async def generate_all_batter_summaries(query_date: str = None) -> list:
         #break
     #print(f"Finished execution of one matchup at {datetime.now()}")
     return summaries
+
+
+async def analyze_home_run_probabilities(query_date: str = None, model: str = "llama3") -> dict:
+    """
+    Analyzes MLB games and predicts home run probabilities for each player,
+    then selects top candidates for final analysis.
+    
+    Args:
+        query_date: Optional date string in YYYY-MM-DD format
+        model: Name of the Ollama model to use
+        
+    Returns:
+        Dictionary with analysis results
+    """
+    # Get all player summaries
+    player_summaries = await generate_all_batter_summaries(query_date)
+    
+    if not player_summaries:
+        return {"error": "No player summaries generated"}
+    
+    # Process each player individually
+    all_predictions = []
+    for summary in player_summaries:
+        prediction = predict_single_player_home_run(summary, model)
+        all_predictions.append(prediction)
+        print(f"Player: {prediction['player']}, Probability: {prediction['probability']}%")
+    
+    # Group players by team
+    teams = defaultdict(list)
+    for prediction in all_predictions:
+        team = prediction.get("team", "Unknown")
+        teams[team].append(prediction)
+    
+    # Select top 3 players from each team
+    top_players = []
+    for team, players in teams.items():
+        # Sort players by probability (highest first)
+        sorted_players = sorted(players, key=itemgetter('probability'), reverse=True)
+        # Take top 3 (or fewer if team has less than 3 players)
+        top_team_players = sorted_players[:3]
+        top_players.extend(top_team_players)
+    
+    # Get final analysis of top players
+    final_analysis = analyze_top_home_run_candidates(top_players, model)
+    
+    return {
+        "all_predictions": all_predictions,
+        "top_players": top_players,
+        "final_analysis": final_analysis,
+        "total_players": len(player_summaries)
+    }
 
 
 # Entry point
@@ -110,9 +164,23 @@ if __name__ == '__main__':
         query_date = sys.argv[1]
         print(f"Using provided date: {query_date}")
 
-    result = asyncio.run(generate_all_batter_summaries(query_date))
-    model_response = predict_home_run_probabilities(result)
-    for response in model_response.get('predictions'):
-        print(f"Player: {response.get('player')}")
-        print(f"Probability: {response.get('probability')}")
-        print(f"Reason: {response.get('reasoning')}")
+    # Optional model parameter
+    model = "llama3"
+    if len(sys.argv) > 2:
+        model = sys.argv[2]
+        print(f"Using model: {model}")
+
+    result = asyncio.run(analyze_home_run_probabilities(query_date, model))
+    
+    # Print top players
+    print("\nTop Home Run Candidates:")
+    for player in result.get('top_players', []):
+        print(f"Player: {player.get('player')}")
+        print(f"Team: {player.get('team')}")
+        print(f"Probability: {player.get('probability')}%")
+        print(f"Reasoning: {player.get('reasoning')[:200]}...")  # Truncate long reasoning
+        print("-" * 40)
+    
+    # Print final analysis
+    print("\nFinal Analysis:")
+    print(result.get('final_analysis', {}).get('analysis', 'No analysis available'))
