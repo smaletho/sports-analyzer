@@ -1,8 +1,8 @@
 import asyncio
 from datetime import date, datetime, timezone
-from homeruns.mlb_schedule import get_mlb_schedule_async
-from homeruns.data_loader import generate_context_summary_async
-from homeruns.predictor import predict_single_player_home_run, analyze_top_home_run_candidates
+from mlb.mlb_schedule import get_mlb_schedule_async
+from mlb.data_loader import generate_context_summary_async
+from mlb.predictor import predict_single_player_home_run, analyze_top_home_run_candidates
 from collections import defaultdict
 from operator import itemgetter
 

@@ -656,7 +656,7 @@ async def fetch_daily_data_async() -> Dict[str, Any]:
     today = date.today().strftime('%Y-%m-%d')
 
     # Import the async version
-    from homeruns.mlb_schedule import get_mlb_schedule_async
+    from mlb.mlb_schedule import get_mlb_schedule_async
 
     # Get today's schedule with parallel processing
     schedule = await get_mlb_schedule_async(today)

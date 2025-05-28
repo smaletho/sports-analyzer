@@ -1,4 +1,4 @@
-# homeruns/predictor.py
+# mlb/predictor.py
 
 import ollama
 import re
